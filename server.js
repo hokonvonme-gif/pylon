@@ -24,7 +24,7 @@ const rand = (p, n) => p + crypto.randomBytes(n).toString('hex');
 const hashPw = pw => new Promise((ok, ko) => { const s = crypto.randomBytes(16).toString('hex'); crypto.scrypt(pw, s, 32, (e, d) => e ? ko(e) : ok(s + ':' + d.toString('hex'))); });
 const checkPw = (pw, h) => new Promise((ok, ko) => { const [s, x] = h.split(':'); crypto.scrypt(pw, s, 32, (e, d) => e ? ko(e) : ok(crypto.timingSafeEqual(d, Buffer.from(x, 'hex')))); });
 const sign = s => crypto.createHmac('sha256', SECRET).update(s).digest('base64url');
-const mkToken = email => { const b = Buffer.from(JSON.stringify({ e: email, x: Date.now() + 30 * 864e5 })).toString('base64url'); return b + '.' + sign(b); };
+const mkToken = (email, ttl = 30 * 864e5) => { const b = Buffer.from(JSON.stringify({ e: email, x: Date.now() + ttl })).toString('base64url'); return b + '.' + sign(b); };
 const readToken = t => {
   try {
     const [b, s] = String(t).split('.');
@@ -106,13 +106,13 @@ app.post('/api/projects', authUser, (req, res) => {
   if (Object.values(db).filter(p => p.owner === req.email).length >= 10) return res.status(400).json({ error: 'Maximum 10 projets par compte' });
   const name = String(req.body.name || 'Mon projet').trim().slice(0, 40) || 'Mon projet';
   const pk = rand('pk_', 8), privateKey = rand('sk_', 24);
-  db[pk] = { owner: req.email, name, hash: sha(privateKey), state: {}, log: [], created: Date.now() };
+  db[pk] = { owner: req.email, name, hash: sha(privateKey), state: {}, log: [], series: {}, controls: [], created: Date.now() };
   dirty.add(pk);
   res.json({ pk, name, privateKey });
 });
 
 app.get('/api/projects/:pk', authUser, owned, (req, res) =>
-  res.json({ pk: req.pk, name: req.p.name, state: req.p.state, log: req.p.log, online: online(req.pk) }));
+  res.json({ pk: req.pk, name: req.p.name, state: req.p.state, log: req.p.log, series: req.p.series || {}, controls: req.p.controls || [], tunnel: tunnelOn(req.pk), online: online(req.pk) }));
 
 app.post('/api/projects/:pk/regenerate', authUser, owned, (req, res) => {
   const privateKey = rand('sk_', 24);
@@ -134,11 +134,23 @@ app.post('/api/projects/:pk/command', authUser, owned, (req, res) => {
   if (!name) return res.status(400).json({ error: 'Le nom de la commande est requis' });
   const l = L(req.pk), t = Date.now();
   l.queue.push({ name, value, t });
-  addLog(req.pk, { t, kind: 'out', data: { [name]: value } });
-  push(req.pk, { type: 'command', t, data: { [name]: value } });
+  if (l.queue.length > 50) l.queue.shift();
+  if (l.lastCmd !== name + '=' + value) {
+    l.lastCmd = name + '=' + value;
+    addLog(req.pk, { t, kind: 'out', data: { [name]: value } });
+    push(req.pk, { type: 'command', t, data: { [name]: value } });
+  }
   const w = l.waiters.shift();
   if (w) { clearTimeout(w.t); w.reply(l.queue.splice(0)); }
   res.json({ ok: true, online: online(req.pk) });
+});
+
+app.put('/api/projects/:pk/controls', authUser, owned, (req, res) => {
+  const ok = ['button', 'switch', 'slider', 'dpad'];
+  req.p.controls = (Array.isArray(req.body) ? req.body : []).slice(0, 16)
+    .filter(c => c && ok.includes(c.type) && String(c.name || '').trim())
+    .map(c => ({ type: c.type, label: String(c.label || c.name).slice(0, 30), name: String(c.name).trim().slice(0, 40), min: +c.min || 0, max: isFinite(+c.max) ? +c.max : 100, value: String(c.value ?? '1').slice(0, 40) }));
+  dirty.add(req.pk); res.json({ ok: true });
 });
 
 // ---------- Cartes (ESP32, Raspberry Pi) ----------
@@ -146,7 +158,14 @@ app.post('/api/device/data', guard, (req, res) => {
   const body = req.body;
   if (!body || typeof body !== 'object' || Array.isArray(body)) return res.status(400).json({ error: 'Objet JSON attendu' });
   const t = Date.now();
-  Object.keys(body).slice(0, 50).forEach(k => { req.p.state[k] = { v: body[k], t }; });
+  const sr = req.p.series = req.p.series || {};
+  Object.keys(body).slice(0, 50).forEach(k => {
+    req.p.state[k] = { v: body[k], t };
+    if (typeof body[k] === 'number' && isFinite(body[k])) {
+      const a = sr[k] = sr[k] || [];
+      if (!a.length || t - a[a.length - 1][0] > 1000) { a.push([t, body[k]]); if (a.length > 100) a.shift(); }
+    }
+  });
   addLog(req.pk, { t, kind: 'in', data: body });
   touch(req.pk);
   push(req.pk, { type: 'data', t, data: body });
@@ -166,6 +185,87 @@ app.get('/api/device/commands', guard, (req, res) => {
   res.on('close', () => { clearTimeout(w.t); l.waiters = l.waiters.filter(x => x !== w); });
 });
 
+// Caméra : la carte envoie des images JPEG, le tableau de bord affiche la dernière
+app.post('/api/device/frame', guard, express.raw({ type: () => true, limit: '300kb' }), (req, res) => {
+  if (!Buffer.isBuffer(req.body) || req.body.length < 100) return res.status(400).json({ error: 'Image JPEG attendue' });
+  const t = Date.now(); L(req.pk).frame = { buf: req.body, t };
+  touch(req.pk); push(req.pk, { type: 'frame', t });
+  res.json({ ok: true });
+});
+app.get('/api/projects/:pk/frame', (req, res) => {
+  const e = readToken(req.query.token), p = db[req.params.pk], f = live[req.params.pk]?.frame;
+  if (!e || !p || p.owner !== e || !f) return res.status(404).end();
+  res.set('Cache-Control', 'no-store').type('image/jpeg').send(f.buf);
+});
+
+// ---------- Tunnel : la page web locale de l'appareil, accessible depuis n'importe où ----------
+const T = pk => { const l = L(pk); return l.t || (l.t = { queue: [], waiters: [], seen: 0 }); };
+const tunnelOn = pk => Date.now() - (live[pk]?.t?.seen || 0) < 40000;
+const pending = {};
+const give = pk => {
+  const t = T(pk);
+  while (t.queue.length && t.waiters.length) { const w = t.waiters.shift(); clearTimeout(w.t); w.send(t.queue.shift()); }
+};
+function rewrite(html, pk) {
+  const P = '/t/' + pk;
+  const shim = `<script>(function(){var P="${P}";function f(u){return typeof u==="string"&&u[0]==="/"&&u[1]!=="/"&&u.indexOf(P+"/")!==0?P+u:u}var F=window.fetch;window.fetch=function(u,o){return F.call(this,f(u),o)};var O=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=f(u);return O.apply(this,arguments)}})();<\/script>`;
+  html = html.replace(/(\s(?:href|src|action)\s*=\s*["'])\/(?!\/)/gi, '$1' + P + '/');
+  return /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, m => m + shim) : shim + html;
+}
+
+app.post('/api/projects/:pk/viewlink', authUser, owned, (req, res) =>
+  res.json({ url: `${req.protocol}://${req.get('host')}/t/${req.pk}/?v=${mkToken(req.email, 120000)}` }));
+
+// L'agent (carte ou Raspberry Pi) récupère la prochaine requête web à relayer
+app.get('/api/tunnel/next', guard, (req, res) => {
+  const t = T(req.pk), was = tunnelOn(req.pk);
+  t.seen = Date.now();
+  if (!was) push(req.pk, { type: 'status', online: online(req.pk), tunnel: true });
+  const text = req.query.format === 'text';
+  const send = j => {
+    const v = { id: j.id, method: j.method, path: j.path, headers: j.headers, body: j.body };
+    text ? res.type('text').send([v.id, v.method, v.path, Buffer.from(v.body, 'base64').toString('utf8')].join('\n')) : res.json(v);
+  };
+  if (t.queue.length) return send(t.queue.shift());
+  const w = { send, t: setTimeout(() => { t.waiters = t.waiters.filter(x => x !== w); t.seen = Date.now(); res.status(204).end(); }, Math.min(25, +req.query.wait || 20) * 1000) };
+  t.waiters.push(w);
+  res.on('close', () => { clearTimeout(w.t); t.waiters = t.waiters.filter(x => x !== w); });
+});
+
+// L'agent renvoie la réponse de la page locale
+app.post('/api/tunnel/respond/:id', guard, express.raw({ type: () => true, limit: '2mb' }), (req, res) => {
+  const j = pending[req.params.id];
+  if (!j || j.pk !== req.pk) return res.status(404).json({ error: 'Requête expirée' });
+  delete pending[j.id]; clearTimeout(j.timer);
+  const ct = req.get('x-content-type') || 'application/octet-stream';
+  let body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  if (/text\/html/i.test(ct)) body = Buffer.from(rewrite(body.toString('utf8'), j.pk));
+  const loc = req.get('x-location');
+  if (loc) j.res.set('Location', loc.startsWith('/') ? '/t/' + j.pk + loc : loc);
+  j.res.status(Math.min(599, Math.max(100, +req.get('x-status') || 200))).set('Content-Type', ct).set('Cache-Control', 'no-store').send(body);
+  res.json({ ok: true });
+});
+
+// Adresse publique de la page : /t/<clé publique>/ (réservée au propriétaire du projet)
+app.all(/^\/t\/(pk_[0-9a-f]+)(\/.*)?$/, express.raw({ type: () => true, limit: '2mb' }), (req, res) => {
+  const pk = req.params[0], p = db[pk];
+  const rest = req.originalUrl.slice(('/t/' + pk).length) || '/';
+  if (req.query.v) {
+    const e = readToken(req.query.v);
+    if (!e || !p || p.owner !== e) return res.status(401).type('text').send('Lien expiré. Rouvrez la page depuis votre tableau de bord Pylon.');
+    res.cookie('pylon_t', mkToken(e, 12 * 3600e3), { httpOnly: true, secure: true, sameSite: 'lax', path: '/t/' + pk, maxAge: 12 * 3600e3 });
+    return res.redirect('/t/' + pk + '/');
+  }
+  const e = readToken((/(?:^|;\s*)pylon_t=([^;]+)/.exec(req.headers.cookie || '') || [])[1]);
+  if (!e || !p || p.owner !== e) return res.status(401).type('text').send('Accès refusé : ouvrez cette page depuis votre tableau de bord Pylon.');
+  if (!tunnelOn(pk)) return res.status(502).type('html').send("<body style='font-family:sans-serif;padding:40px'><h2>Appareil hors ligne</h2><p>L'agent du tunnel ne répond pas. Vérifiez qu'il tourne sur votre carte ou votre Raspberry Pi.</p></body>");
+  const t = T(pk), id = rand('r', 6), hdr = {};
+  ['content-type', 'accept'].forEach(h => { if (req.headers[h]) hdr[h] = req.headers[h]; });
+  const job = { id, pk, res, method: req.method, path: rest, headers: hdr, body: Buffer.isBuffer(req.body) ? req.body.toString('base64') : '' };
+  job.timer = setTimeout(() => { delete pending[id]; t.queue = t.queue.filter(x => x !== job); res.status(504).type('text').send("L'appareil n'a pas répondu à temps."); }, 25000);
+  pending[id] = job; t.queue.push(job); give(pk);
+});
+
 // ---------- Temps réel (tableau de bord) ----------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -174,9 +274,9 @@ wss.on('connection', (ws, req) => {
   if (!email || !p || p.owner !== email) return ws.close(4001);
   L(pk).dash.add(ws);
   ws.on('close', () => L(pk).dash.delete(ws));
-  ws.send(JSON.stringify({ type: 'snapshot', state: p.state, log: p.log, online: online(pk) }));
+  ws.send(JSON.stringify({ type: 'snapshot', state: p.state, log: p.log, series: p.series || {}, frame: live[pk]?.frame?.t || 0, tunnel: tunnelOn(pk), online: online(pk) }));
 });
-setInterval(() => Object.keys(live).forEach(pk => push(pk, { type: 'status', online: online(pk) })), 10000);
+setInterval(() => Object.keys(live).forEach(pk => push(pk, { type: 'status', online: online(pk), tunnel: tunnelOn(pk) })), 10000);
 
 (async () => {
   await client.connect();
