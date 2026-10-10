@@ -35,6 +35,7 @@ const readToken = t => {
 
 // Limitation par IP (en mémoire)
 const hits = {};
+const ipOf = req => req.get('x-pylon-client-ip') || req.ip;
 const limited = (key, max, ms) => {
   const now = Date.now(), a = (hits[key] || []).filter(t => now - t < ms);
   if (a.length >= max) { hits[key] = a; return true; }
@@ -74,12 +75,14 @@ const owned = (req, res, next) => {
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors());
+app.use((req, res, next) => { res.set('X-Pylon', '1'); next(); });
+app.use((req, res, next) => { if (/^\/(api|t)\//.test(req.path)) res.set('Cache-Control', 'no-store'); next(); });
 app.use(express.json({ limit: '100kb' }));
 app.get('/', (_, res) => res.json({ service: 'pylon', ok: true }));
 
 // ---------- Comptes ----------
 app.post('/api/register', async (req, res) => {
-  if (limited('reg:' + req.ip, 5, 3600000)) return res.status(429).json({ error: 'Trop de créations de compte, réessayez plus tard' });
+  if (limited('reg:' + ipOf(req), 5, 3600000)) return res.status(429).json({ error: 'Trop de créations de compte, réessayez plus tard' });
   const email = String(req.body.email || '').trim().toLowerCase(), pw = String(req.body.password || '');
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 120) return res.status(400).json({ error: 'Adresse email invalide' });
   if (pw.length < 8 || pw.length > 200) return res.status(400).json({ error: 'Mot de passe : 8 caractères minimum' });
@@ -88,7 +91,7 @@ app.post('/api/register', async (req, res) => {
   res.json({ token: mkToken(email), email });
 });
 app.post('/api/login', async (req, res) => {
-  if (limited('log:' + req.ip, 10, 900000)) return res.status(429).json({ error: 'Trop de tentatives, réessayez dans 15 minutes' });
+  if (limited('log:' + ipOf(req), 10, 900000)) return res.status(429).json({ error: 'Trop de tentatives, réessayez dans 15 minutes' });
   const email = String(req.body.email || '').trim().toLowerCase();
   const u = await users.findOne({ _id: email });
   if (!u || !(await checkPw(String(req.body.password || ''), u.hash))) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
@@ -102,7 +105,7 @@ app.get('/api/projects', authUser, (req, res) =>
     .sort((a, b) => b.created - a.created)));
 
 app.post('/api/projects', authUser, (req, res) => {
-  if (limited('prj:' + req.ip, 5, 3600000)) return res.status(429).json({ error: 'Limite atteinte : 5 projets par heure' });
+  if (limited('prj:' + ipOf(req), 5, 3600000)) return res.status(429).json({ error: 'Limite atteinte : 5 projets par heure' });
   if (Object.values(db).filter(p => p.owner === req.email).length >= 10) return res.status(400).json({ error: 'Maximum 10 projets par compte' });
   const name = String(req.body.name || 'Mon projet').trim().slice(0, 40) || 'Mon projet';
   const pk = rand('pk_', 8), privateKey = rand('sk_', 24);
@@ -112,7 +115,7 @@ app.post('/api/projects', authUser, (req, res) => {
 });
 
 app.get('/api/projects/:pk', authUser, owned, (req, res) =>
-  res.json({ pk: req.pk, name: req.p.name, state: req.p.state, log: req.p.log, series: req.p.series || {}, controls: req.p.controls || [], tunnel: tunnelOn(req.pk), online: online(req.pk) }));
+  res.json({ pk: req.pk, name: req.p.name, state: req.p.state, log: req.p.log, series: req.p.series || {}, controls: req.p.controls || [], tunnel: tunnelOn(req.pk), frame: live[req.pk]?.frame?.t || 0, online: online(req.pk) }));
 
 app.post('/api/projects/:pk/regenerate', authUser, owned, (req, res) => {
   const privateKey = rand('sk_', 24);
@@ -214,7 +217,7 @@ function rewrite(html, pk) {
 }
 
 app.post('/api/projects/:pk/viewlink', authUser, owned, (req, res) =>
-  res.json({ url: `${req.protocol}://${req.get('host')}/t/${req.pk}/?v=${mkToken(req.email, 120000)}` }));
+  res.json({ path: `/t/${req.pk}/?v=${mkToken(req.email, 120000)}` }));
 
 // L'agent (carte ou Raspberry Pi) récupère la prochaine requête web à relayer
 app.get('/api/tunnel/next', guard, (req, res) => {
