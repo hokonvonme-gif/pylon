@@ -24,12 +24,12 @@ const rand = (p, n) => p + crypto.randomBytes(n).toString('hex');
 const hashPw = pw => new Promise((ok, ko) => { const s = crypto.randomBytes(16).toString('hex'); crypto.scrypt(pw, s, 32, (e, d) => e ? ko(e) : ok(s + ':' + d.toString('hex'))); });
 const checkPw = (pw, h) => new Promise((ok, ko) => { const [s, x] = h.split(':'); crypto.scrypt(pw, s, 32, (e, d) => e ? ko(e) : ok(crypto.timingSafeEqual(d, Buffer.from(x, 'hex')))); });
 const sign = s => crypto.createHmac('sha256', SECRET).update(s).digest('base64url');
-const mkToken = (email, ttl = 30 * 864e5) => { const b = Buffer.from(JSON.stringify({ e: email, x: Date.now() + ttl })).toString('base64url'); return b + '.' + sign(b); };
+const mkToken = (email, ttl) => { const b = Buffer.from(JSON.stringify({ e: email, x: ttl ? Date.now() + ttl : 0 })).toString('base64url'); return b + '.' + sign(b); };
 const readToken = t => {
   try {
     const [b, s] = String(t).split('.');
     if (!b || !s || !crypto.timingSafeEqual(Buffer.from(sign(b)), Buffer.from(s))) return null;
-    const p = JSON.parse(Buffer.from(b, 'base64url')); return p.x > Date.now() ? p.e : null;
+    const p = JSON.parse(Buffer.from(b, 'base64url')); return !p.x || p.x > Date.now() ? p.e : null;
   } catch { return null; }
 };
 
@@ -109,13 +109,13 @@ app.post('/api/projects', authUser, (req, res) => {
   if (Object.values(db).filter(p => p.owner === req.email).length >= 10) return res.status(400).json({ error: 'Maximum 10 projets par compte' });
   const name = String(req.body.name || 'Mon projet').trim().slice(0, 40) || 'Mon projet';
   const pk = rand('pk_', 8), privateKey = rand('sk_', 24);
-  db[pk] = { owner: req.email, name, hash: sha(privateKey), state: {}, log: [], series: {}, controls: [], created: Date.now() };
+  db[pk] = { owner: req.email, name, hash: sha(privateKey), state: {}, log: [], series: {}, controls: [], page: 'public', created: Date.now() };
   dirty.add(pk);
   res.json({ pk, name, privateKey });
 });
 
 app.get('/api/projects/:pk', authUser, owned, (req, res) =>
-  res.json({ pk: req.pk, name: req.p.name, state: req.p.state, log: req.p.log, series: req.p.series || {}, controls: req.p.controls || [], tunnel: tunnelOn(req.pk), frame: live[req.pk]?.frame?.t || 0, online: online(req.pk) }));
+  res.json({ pk: req.pk, name: req.p.name, state: req.p.state, log: req.p.log, series: req.p.series || {}, controls: req.p.controls || [], tunnel: tunnelOn(req.pk), page: req.p.page || 'private', frame: live[req.pk]?.frame?.t || 0, online: online(req.pk) }));
 
 app.post('/api/projects/:pk/regenerate', authUser, owned, (req, res) => {
   const privateKey = rand('sk_', 24);
@@ -154,6 +154,12 @@ app.put('/api/projects/:pk/controls', authUser, owned, (req, res) => {
     .filter(c => c && ok.includes(c.type) && String(c.name || '').trim())
     .map(c => ({ type: c.type, label: String(c.label || c.name).slice(0, 30), name: String(c.name).trim().slice(0, 40), min: +c.min || 0, max: isFinite(+c.max) ? +c.max : 100, value: String(c.value ?? '1').slice(0, 40) }));
   dirty.add(req.pk); res.json({ ok: true });
+});
+
+// Accès à la page web de l'appareil : 'public' (tous ceux qui ont le lien) ou 'private' (propriétaire connecté)
+app.put('/api/projects/:pk/page', authUser, owned, (req, res) => {
+  req.p.page = req.body.access === 'public' ? 'public' : 'private';
+  dirty.add(req.pk); res.json({ ok: true, page: req.p.page });
 });
 
 // ---------- Cartes (ESP32, Raspberry Pi) ----------
@@ -256,11 +262,11 @@ app.all(/^\/t\/(pk_[0-9a-f]+)(\/.*)?$/, express.raw({ type: () => true, limit: '
   if (req.query.v) {
     const e = readToken(req.query.v);
     if (!e || !p || p.owner !== e) return res.status(401).type('text').send('Lien expiré. Rouvrez la page depuis votre tableau de bord Pylon.');
-    res.cookie('pylon_t', mkToken(e, 12 * 3600e3), { httpOnly: true, secure: true, sameSite: 'lax', path: '/t/' + pk, maxAge: 12 * 3600e3 });
+    res.cookie('pylon_t', mkToken(e), { httpOnly: true, secure: true, sameSite: 'lax', path: '/t/' + pk, maxAge: 3650 * 864e5 });
     return res.redirect('/t/' + pk + '/');
   }
   const e = readToken((/(?:^|;\s*)pylon_t=([^;]+)/.exec(req.headers.cookie || '') || [])[1]);
-  if (!e || !p || p.owner !== e) return res.status(401).type('text').send('Accès refusé : ouvrez cette page depuis votre tableau de bord Pylon.');
+  if (!p || (p.page !== 'public' && (!e || p.owner !== e))) return res.status(401).type('text').send('Accès refusé : cette page est protégée. Ouvrez-la depuis votre tableau de bord Pylon.');
   if (!tunnelOn(pk)) return res.status(502).type('html').send("<body style='font-family:sans-serif;padding:40px'><h2>Appareil hors ligne</h2><p>L'agent du tunnel ne répond pas. Vérifiez qu'il tourne sur votre carte ou votre Raspberry Pi.</p></body>");
   const t = T(pk), id = rand('r', 6), hdr = {};
   ['content-type', 'accept'].forEach(h => { if (req.headers[h]) hdr[h] = req.headers[h]; });
